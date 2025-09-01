@@ -5,10 +5,11 @@ const balancedSamplers = ['Euler a', 'Euler', 'DPM++ SDE', 'DPM++ 2M', 'UniPC']
 
 type SizePreset = 'Portrait' | 'Landscape' | 'Square' | 'Custom'
 
-function usePoll<T>(fn: () => Promise<T>, deps: any[], ms = 500) {
+function usePoll<T>(fn: () => Promise<T>, deps: any[], ms = 500, active = true) {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
+    if (!active) return
     let stop = false
     let timer: any
     async function tick() {
@@ -23,7 +24,7 @@ function usePoll<T>(fn: () => Promise<T>, deps: any[], ms = 500) {
     }
     tick()
     return () => { stop = true; if (timer) clearTimeout(timer) }
-  }, deps)
+  }, [...deps, active])
   return { data, error }
 }
 
@@ -46,6 +47,11 @@ export default function App() {
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null)
   const [library, setLibrary] = useState<{ checkpoints: any[] }>({ checkpoints: [] })
   const [loadingLibrary, setLoadingLibrary] = useState(false)
+  const [logs, setLogs] = useState<string[]>([])
+  const [startTime, setStartTime] = useState<number | null>(null)
+  const [elapsedMs, setElapsedMs] = useState(0)
+  const lastProgressRef = useRef<number>(0)
+  const timerRef = useRef<any>(null)
 
   useEffect(() => {
     if (sizePreset === 'Portrait') { setWidth(832); setHeight(1216) }
@@ -53,10 +59,13 @@ export default function App() {
     else if (sizePreset === 'Square') { setWidth(1024); setHeight(1024) }
   }, [sizePreset])
 
+  const [pollActive, setPollActive] = useState<boolean>(false)
+  useEffect(() => { setPollActive(!!jobId) }, [jobId])
   const { data: job } = usePoll<JobStatus>(
     async () => jobId ? await getJob(jobId) : Promise.resolve({ status: 'queued', progress: 0, images: [] } as any),
     [jobId],
-    500
+    500,
+    pollActive
   )
 
   useEffect(() => {
@@ -64,6 +73,42 @@ export default function App() {
       setSelectedImageId(job.images[job.images.length - 1].id)
     }
   }, [job?.images?.length])
+
+  // Log when a new image arrives
+  const lastImgCountRef = useRef<number>(0)
+  useEffect(() => {
+    const n = job?.images?.length ?? 0
+    if (n > lastImgCountRef.current) {
+      setLogs(prev => [...prev, `Image ${n} received`])
+      lastImgCountRef.current = n
+    }
+  }, [job?.images?.length])
+
+  // Timer handling
+  useEffect(() => {
+    if (startTime != null && (job?.status === 'running' || (jobId && !job))) {
+      if (!timerRef.current) {
+        timerRef.current = setInterval(() => {
+          setElapsedMs(Date.now() - (startTime as number))
+        }, 100)
+      }
+    } else {
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
+    }
+    return () => { if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null } }
+  }, [job?.status, startTime, jobId])
+
+  // Stop polling and finalize timer when job finishes
+  useEffect(() => {
+    if (job && ['done','error','canceled'].includes(job.status as any)) {
+      setPollActive(false)
+      if (startTime != null) {
+        setElapsedMs(Date.now() - startTime)
+        setStartTime(null)
+        setLogs(prev => [...prev, `Job ${job.status} in ${(Date.now()-startTime).toFixed(0)} ms`])
+      }
+    }
+  }, [job?.status])
 
   async function onGenerate() {
     if (!modelPath) {
@@ -83,8 +128,19 @@ export default function App() {
       posEmbeddings: [],
       negEmbeddings: [],
     }
+    setLogs(prev => [
+      ...prev,
+      `Generate clicked: ${new Date().toLocaleTimeString()}`,
+      `Model: ${modelPath.split('\\').pop() || modelPath}`,
+      `Size: ${width}x${height}, Steps: ${steps}, CFG: ${cfg}, Sampler: ${sampler}`,
+    ])
+    setStartTime(Date.now())
+    setElapsedMs(0)
+    lastProgressRef.current = 0
     const { jobId } = await startGenerate(payload)
     setJobId(jobId)
+    setPollActive(true)
+    setLogs(prev => [...prev, `Job started: ${jobId}`])
   }
 
   async function loadLibrary() {
@@ -97,6 +153,24 @@ export default function App() {
   useEffect(() => { loadLibrary() }, [])
 
   const selectedUrl = useMemo(() => selectedImageId ? imageUrl(selectedImageId) : '', [selectedImageId])
+
+  // Log progress changes (every 5%) and warnings
+  useEffect(() => {
+    if (!job) return
+    const p = job.progress ?? 0
+    const last = lastProgressRef.current
+    if (p >= last + 5) {
+      lastProgressRef.current = p
+      setLogs(prev => [...prev.slice(-500), `Progress: ${p}%`])
+    }
+    if (job.warnings && job.warnings.length) {
+      setLogs(prev => {
+        const existing = new Set(prev)
+        const newItems = job.warnings.filter(w => !existing.has(w))
+        return newItems.length ? [...prev, ...newItems] : prev
+      })
+    }
+  }, [job?.progress, job?.warnings?.length])
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 0.9fr', gap: 16, padding: 16 }}>
@@ -182,8 +256,21 @@ export default function App() {
           <button onClick={onGenerate} disabled={job?.status === 'running'} style={{ padding: '10px 16px', fontWeight: 600 }}>
             {job?.status === 'running' ? `Generating… ${job?.progress ?? 0}%` : 'Generate'}
           </button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <progress value={job?.status === 'running' ? job?.progress ?? 0 : 0} max={100} style={{ width: 260, height: 14 }} />
+            <span style={{ minWidth: 70, display: 'inline-block', textAlign: 'right' }}>{job?.status === 'running' ? `${job?.progress ?? 0}%` : '0%'}</span>
+            <span style={{ marginLeft: 12, fontVariantNumeric: 'tabular-nums' }}>
+              ⏱ {((startTime ? elapsedMs : elapsedMs) / 1000).toFixed(1)}s
+            </span>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <label style={{ display: 'block', fontWeight: 600 }}>Logs</label>
+            <textarea readOnly value={logs.join('\n')} rows={6} style={{ width: '100%', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' }} />
+          </div>
           {job?.warnings?.length ? (
-            <div style={{ color: '#a78400', marginTop: 8 }}>{job.warnings.join(' • ')}</div>
+            <div style={{ color: '#a78400', marginTop: 6 }}>{job.warnings.join(' • ')}</div>
           ) : null}
         </div>
       </div>

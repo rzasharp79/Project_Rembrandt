@@ -184,6 +184,154 @@ def make_placeholder_image(path: str, width: int, height: int, meta: dict) -> No
     write_png(path, width, height, bytes(pixels), "parameters", json.dumps(meta))
 
 
+# ------------ Optional: Diffusers runtime (real image generation) ------------
+HAVE_DIFFUSERS = False
+try:  # Heavy, optional deps
+    import numpy as _np  # type: ignore
+    import torch  # type: ignore
+    from diffusers import (  # type: ignore
+        StableDiffusionPipeline,
+        EulerDiscreteScheduler,
+        EulerAncestralDiscreteScheduler,
+        DPMSolverMultistepScheduler,
+        UniPCMultistepScheduler,
+    )
+
+    HAVE_DIFFUSERS = True
+except Exception:  # pragma: no cover - optional path
+    _np = None  # type: ignore
+    torch = None  # type: ignore
+
+
+class DiffusersEngine:
+    def __init__(self, settings_store: "SettingsStore"):
+        self.settings_store = settings_store
+        self.pipe = None
+        self.model_path = None
+        self.device = "cpu"
+        self.dtype = None
+
+    def _select_device_dtype(self):
+        st = self.settings_store.load()
+        # device: auto|cpu|cuda
+        if st.device == "auto":
+            use_cuda = bool(torch and torch.cuda.is_available())
+            self.device = "cuda" if use_cuda else "cpu"
+        else:
+            self.device = "cuda" if st.device == "cuda" and torch and torch.cuda.is_available() else "cpu"
+
+        # dtype: fp16|fp32
+        if st.precision.lower() == "fp16" and self.device != "cpu":
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
+
+    def _ensure_pipe(self, model_path: str, warnings: list[str]):
+        if not HAVE_DIFFUSERS:
+            raise RuntimeError("Diffusers/Torch not installed")
+
+        if self.pipe is not None and self.model_path == model_path:
+            return
+
+        self._select_device_dtype()
+
+        # Free previous pipe
+        if self.pipe is not None:
+            try:
+                self.pipe.to("cpu")
+                del self.pipe
+            except Exception:
+                pass
+            self.pipe = None
+
+        # Load from a single-file checkpoint (.safetensors)
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
+
+        # Safety checker disabled for local use
+        self.pipe = StableDiffusionPipeline.from_single_file(
+            model_path,
+            torch_dtype=self.dtype,
+            safety_checker=None,
+        )
+        self.pipe.to(self.device)
+        self.model_path = model_path
+
+        # Memory guard (xformers/attention slicing if desired)
+        st = self.settings_store.load()
+        if st.memory_guard and self.device == "cuda":
+            try:
+                self.pipe.enable_attention_slicing()
+            except Exception:
+                warnings.append("Attention slicing not available; continuing")
+
+    def _apply_sampler(self, sampler_name: str, warnings: list[str]):
+        if not self.pipe:
+            return
+        s = sampler_name
+        try:
+            if s == "Euler a":
+                self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
+            elif s == "Euler":
+                self.pipe.scheduler = EulerDiscreteScheduler.from_config(self.pipe.scheduler.config)
+            elif s == "UniPC":
+                self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+            elif s in {"DPM++ SDE", "DPM++ 2M"}:
+                # Closest widely available scheduler
+                self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(self.pipe.scheduler.config)
+                if s != "DPM++ 2M":
+                    warnings.append(f"Sampler '{s}' approximated via DPMSolverMultistep")
+            else:
+                self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
+                if s != "Euler a":
+                    warnings.append(f"Unknown sampler '{s}'; using Euler a")
+        except Exception as e:  # fall back
+            self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
+            warnings.append(f"Sampler '{s}' not supported by pipeline; using Euler a")
+
+    def generate(self, req: "GenerateRequest", seed: int, progress_cb=None) -> "bytes":
+        warnings: list[str] = []
+        self._ensure_pipe(req.modelPath, warnings)
+        self._apply_sampler(req.sampler, warnings)
+
+        if req.clipSkip and req.clipSkip > 0:
+            warnings.append("CLIP skip not implemented; ignored")
+        if req.loras:
+            warnings.append("LoRA loading not implemented yet; ignored")
+        if req.posEmbeddings or req.negEmbeddings:
+            warnings.append("Embeddings not implemented yet; ignored")
+
+        # Generator for deterministic seeds
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
+        # Handle progress callback via Diffusers callback
+        cb_steps = max(1, int(req.steps / 10))
+
+        def _cb(step: int, t, latents):  # type: ignore
+            if progress_cb:
+                try:
+                    progress_cb(step)
+                except Exception:
+                    pass
+
+        result = self.pipe(
+            prompt=req.prompt,
+            negative_prompt=(req.negativePrompt or None),
+            num_inference_steps=req.steps,
+            guidance_scale=req.cfg,
+            width=req.width,
+            height=req.height,
+            generator=generator,
+            callback=_cb,
+            callback_steps=cb_steps,
+        )
+
+        img = result.images[0]
+        # Convert to raw RGBA bytes and return PNG bytes with metadata
+        arr = _np.array(img.convert("RGBA"), dtype=_np.uint8)
+        return arr.tobytes(), warnings
+
+
 # ------------ Job Manager & Engine Abstraction ------------
 class Job:
     def __init__(self, req: GenerateRequest, outputs_root: str):
@@ -216,6 +364,8 @@ class JobManager:
         self._lock = threading.Lock()
         self.settings_store = settings
         self.active_model: Optional[str] = None
+        # Prepare optional engine
+        self.engine: Optional[DiffusersEngine] = DiffusersEngine(settings) if HAVE_DIFFUSERS else None
 
     def create(self, req: GenerateRequest) -> Job:
         st = self.settings_store.load()
@@ -248,22 +398,16 @@ class JobManager:
         # Seed behavior
         base_seed = req.seed if req.seed is not None else int.from_bytes(os.urandom(4), "big")
 
-        # Simulate generation per image; write placeholder PNGs with embedded metadata
+        # Generate per image
         for i in range(req.batchCount):
             if job._cancel:
                 job.status = "canceled"
                 job.progress = 0
                 return
 
-            # Simulate step progress
-            for step in range(total_steps):
-                if job._cancel:
-                    job.status = "canceled"
-                    return
-                # Simulate work
-                time.sleep(0.01)  # keep it responsive; real engine does work here
-                # update progress coarse-grained
-                pct = int(((i * total_steps) + (step + 1)) / (req.batchCount * total_steps) * 100)
+            # Progress callback updates (works for both engines)
+            def _on_step(step_idx: int):
+                pct = int(((i * total_steps) + min(step_idx + 1, total_steps)) / (req.batchCount * total_steps) * 100)
                 job.progress = min(99, pct)
 
             seed_i = base_seed if req.seedLocked else (base_seed + i)
@@ -287,7 +431,25 @@ class JobManager:
                 "appVersion": "1.0",
                 "createdAt": datetime.now().isoformat(),
             }
-            make_placeholder_image(fpath, req.width, req.height, meta)
+            wrote = False
+            runtime_warnings: list[str] = []
+            if self.engine is not None:
+                try:
+                    rgba_bytes, ew = self.engine.generate(req, seed=seed_i, progress_cb=_on_step)
+                    runtime_warnings.extend(ew)
+                    from json import dumps as _dumps
+                    write_png(fpath, req.width, req.height, rgba_bytes, "parameters", _dumps(meta))
+                    wrote = True
+                except Exception as e:
+                    runtime_warnings.append(f"Diffusers runtime failed: {e}")
+            if not wrote:
+                # Fallback placeholder
+                job.warnings.append("Using placeholder generator (install with -Full for real images)")
+                make_placeholder_image(fpath, req.width, req.height, meta)
+            # Merge runtime warnings
+            for w in runtime_warnings:
+                if w not in job.warnings:
+                    job.warnings.append(w)
 
             img = ImageInfo(
                 id=uuid.uuid4().hex,

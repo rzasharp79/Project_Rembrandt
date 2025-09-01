@@ -8,7 +8,7 @@ Version Control
 
 - Version: 1.0.0
 - Date: 2025-09-01
-- Status: Preview (placeholder image engine; Diffusers wiring pending)
+- Status: Preview (Diffusers engine optional; falls back to placeholder if not installed)
 - SemVer: Follows semantic versioning (MAJOR.MINOR.PATCH)
 
 Changelog
@@ -63,7 +63,7 @@ Architecture
 - `backend/` FastAPI app (`backend/app.py`)
   - Endpoints: `/generate`, `/job/{id}`, `/cancel/{id}`, `/image/{imageId}`, `/library/index`, `/settings`
   - Job manager: threaded jobs with progress and cancelation
-  - Placeholder engine: creates PNGs locally (no heavy deps required)
+- Runtime: If Diffusers/Torch are installed, backend runs real Stable Diffusion from local `.safetensors` checkpoints; otherwise it creates lightweight placeholder PNGs.
 - `web/` React app (Vite)
   - Generate screen, filmstrip, and model picker wired to API
   - Dev server or static build served by backend
@@ -197,8 +197,8 @@ Generation finishes but images don’t appear
 - Check `GET /job/{id}` → `images[]` entries. If empty, see server logs.
 
 Slow or no GPU acceleration
-- Current build uses a placeholder CPU image writer; Diffusers/PyTorch integration is pending.
-- When enabling Diffusers later, install a CUDA-enabled PyTorch matching your driver.
+- Without Diffusers/Torch installed, the app saves placeholder images (colored gradients). Install full deps to enable real generation.
+- For GPU, install a CUDA-enabled PyTorch matching your driver.
 
 “Module not found” or Python version errors
 - Use Python 3.10–3.12 and recreate the venv. Run `pip install -r backend/requirements.txt` again.
@@ -223,5 +223,14 @@ Roadmap
 Notes
 -----
 
-- The current engine generates placeholder images locally without external libraries. Swap to Diffusers later for real images.
+- Real generation requires installing full backend deps (PyTorch, Diffusers). Use `install.ps1 -Full` or install `backend/requirements.txt` in your venv.
+- If full deps aren’t present, the backend gracefully falls back to placeholder images so the UI remains usable.
 - See `_instructions_for_agent.md` for the full product brief and test checklist.
+
+# TODO
+-----
+🟥 Speed up the generation time.</br>
+🟥 Add a progress bar. </br>
+🟥 Add a textbox that acts as a log for debugging purposes. </br>
+🟥 Add a timer that starts when the user hits generate and stops after image generated. </br>
+🟥 Fix the ugly UI </br>
